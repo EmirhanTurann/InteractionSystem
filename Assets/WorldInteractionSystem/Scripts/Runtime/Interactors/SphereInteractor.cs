@@ -26,9 +26,6 @@ namespace WorldInteractionSystem.Runtime.Interactors
 
         [SerializeField] private LayerMask m_OcclusionMask;
 
-        [Tooltip("Legacy. ClosestPoint kullanıldığı için artık sadece debug/override amaçlı.")]
-        [SerializeField] private Vector3 m_TargetOffset = new Vector3(0f, 1.0f, 0f);
-
         [Header("Scoring")]
         [Min(0f)]
         [SerializeField] private float m_DistanceWeight = 1.0f;
@@ -114,20 +111,29 @@ namespace WorldInteractionSystem.Runtime.Interactors
             if (!TryFindBest(context, out IInteractable best, out InteractionCheckResult bestCheck))
             {
                 if (m_DebugLogs)
-                    Debug.Log($"{name}: No valid interactable found.", this);
+                    Debug.Log($"{name}: No target found (no candidates in range/angle/LOS).", this);
 
+                // UI cache temizle
+                m_LastTarget = null;
+                m_LastTargetCheck = default;
                 return;
             }
 
+            // UI/debug cache
             m_LastTarget = best;
             m_LastTargetCheck = bestCheck;
 
             if (m_DebugLogs)
-                Debug.Log($"{name}: Best target = {best} | type={best.Type} | reason={bestCheck.BlockReason}", this);
+                Debug.Log($"{name}: Target = {best} | type={best.Type} | can={bestCheck.CanInteract} reason={bestCheck.BlockReason}", this);
+
+            // Eğer hedef blocked ise Interact çağırmak yerine sadece feedback ver.
+            // (UI zaten LastTargetCheck üzerinden "Locked" vs. gösterebilir.)
+            if (!bestCheck.CanInteract)
+                return;
 
             if (best is HoldInteractable hold)
             {
-                BeginHold(hold, context, bestCheck);
+                BeginHold(hold, context);
                 return;
             }
 
@@ -138,11 +144,8 @@ namespace WorldInteractionSystem.Runtime.Interactors
 
         #region Hold Flow
 
-        private void BeginHold(HoldInteractable hold, InteractorContext context, InteractionCheckResult checkResult)
+        private void BeginHold(HoldInteractable hold, InteractorContext context)
         {
-            if (!checkResult.CanInteract)
-                return;
-
             float duration = hold.GetHoldDuration(context);
             if (duration <= 0f)
             {
@@ -213,10 +216,16 @@ namespace WorldInteractionSystem.Runtime.Interactors
             best = null;
             bestCheck = default;
 
+            // Blocked fallback
+            IInteractable bestBlocked = null;
+            InteractionCheckResult bestBlockedCheck = default;
+
+            float bestScore = float.MaxValue;
+            float bestBlockedScore = float.MaxValue;
+
             Transform view = context.ViewTransform != null ? context.ViewTransform : context.InteractorTransform;
             Vector3 origin = view.position;
 
-            // Forward fallback (bazı riglerde forward saçmalayabilir)
             Vector3 forward = view.forward;
             if (forward.sqrMagnitude < MinVectorSqr)
                 forward = context.InteractorTransform.forward;
@@ -234,20 +243,13 @@ namespace WorldInteractionSystem.Runtime.Interactors
             if (count <= 0)
                 return false;
 
-            float bestScore = float.MaxValue;
-
             for (int i = 0; i < count; i++)
             {
                 Collider col = m_Overlap[i];
                 if (col == null)
-                {
-                    if (m_DebugLogs)
-                        Debug.LogWarning($"{name}: Candidate collider is null at index {i}.", this);
-
                     continue;
-                }
 
-                // Door-proof: self/parent/root children fallback
+                // Daha toleranslı candidate arama
                 IInteractable candidate =
                     col.GetComponent<IInteractable>() ??
                     col.GetComponentInParent<IInteractable>() ??
@@ -256,24 +258,17 @@ namespace WorldInteractionSystem.Runtime.Interactors
                 if (candidate == null)
                 {
                     if (m_DebugLogs)
-                        Debug.Log($"{name}: Reject '{col.name}' -> no IInteractable found (self/parent/root children).", this);
-
+                        Debug.Log($"{name}: Reject '{col.name}' -> no IInteractable found.", this);
                     continue;
                 }
 
-                // Door-proof target: ClosestPoint (offset pivot saçmalığını bitirir)
+                // Kapı-proof hedef noktası: ClosestPoint
                 Vector3 targetPos = col.ClosestPoint(origin);
-
                 Vector3 toTarget = targetPos - origin;
                 float sqrDistance = toTarget.sqrMagnitude;
 
                 if (sqrDistance <= MinVectorSqr)
-                {
-                    if (m_DebugLogs)
-                        Debug.Log($"{name}: Reject '{candidate}' -> too close/invalid vector.", this);
-
                     continue;
-                }
 
                 float angle01 = 0f;
                 if (m_UseViewAngle)
@@ -282,9 +277,7 @@ namespace WorldInteractionSystem.Runtime.Interactors
                     if (angle > m_MaxViewAngle)
                     {
                         if (m_DebugLogs)
-                            Debug.Log($"{name}: Reject '{candidate}' -> angle {angle:0.0} > {m_MaxViewAngle:0.0}. " +
-                                      $"(origin={origin}, target={targetPos}, forward={forward})", this);
-
+                            Debug.Log($"{name}: Reject '{candidate}' -> angle {angle:0.0} > {m_MaxViewAngle:0.0}.", this);
                         continue;
                     }
 
@@ -297,38 +290,56 @@ namespace WorldInteractionSystem.Runtime.Interactors
                     {
                         if (m_DebugLogs)
                             Debug.Log($"{name}: Reject '{candidate}' -> LOS blocked ({losHitInfo}).", this);
-
                         continue;
                     }
                 }
 
-                InteractionCheckResult check = GetCheckResult(candidate, context);
-                if (!check.CanInteract)
-                {
-                    if (m_DebugLogs)
-                        Debug.Log($"{name}: Reject '{candidate}' -> Check failed reason={check.BlockReason} remaining={check.RemainingTime:0.00}.", this);
-
-                    continue;
-                }
-
+                // Score
                 float distance01 = Mathf.Clamp01(sqrDistance / (m_Range * m_Range));
                 float score = (distance01 * m_DistanceWeight) + (angle01 * m_AngleWeight);
 
-                if (m_DebugLogs)
-                    Debug.Log($"{name}: Candidate OK '{candidate}' dist01={distance01:0.00} angle01={angle01:0.00} score={score:0.000}.", this);
+                // Check
+                InteractionCheckResult check = GetCheckResult(candidate, context);
 
-                if (score < bestScore)
+                if (check.CanInteract)
                 {
-                    bestScore = score;
-                    best = candidate;
-                    bestCheck = check;
+                    if (m_DebugLogs)
+                        Debug.Log($"{name}: Candidate OK '{candidate}' score={score:0.000}.", this);
+
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        best = candidate;
+                        bestCheck = check;
+                    }
+                }
+                else
+                {
+                    // Fallback: blocked candidate seçilebilir (Locked gibi)
+                    if (m_DebugLogs)
+                        Debug.Log($"{name}: Candidate BLOCKED '{candidate}' reason={check.BlockReason} score={score:0.000}.", this);
+
+                    if (score < bestBlockedScore)
+                    {
+                        bestBlockedScore = score;
+                        bestBlocked = candidate;
+                        bestBlockedCheck = check;
+                    }
                 }
             }
 
-            if (m_DebugLogs && best != null)
-                Debug.Log($"{name}: Selected BEST '{best}' score={bestScore:0.000}", this);
+            // Önce interactable hedef, yoksa blocked hedef
+            if (best != null)
+                return true;
 
-            return best != null;
+            if (bestBlocked != null)
+            {
+                best = bestBlocked;
+                bestCheck = bestBlockedCheck;
+                return true;
+            }
+
+            return false;
         }
 
         private bool HasLineOfSight(Vector3 origin, Vector3 target, Collider targetCollider, out string hitInfo)
