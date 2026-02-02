@@ -1,0 +1,385 @@
+﻿using UnityEngine;
+using WorldInteractionSystem.Runtime.Core;
+using WorldInteractionSystem.Runtime.Interactables;
+
+namespace WorldInteractionSystem.Runtime.Interactors
+{
+    public sealed class SphereInteractor : MonoBehaviour
+    {
+        #region Inspector
+
+        [Header("Scan")]
+        [SerializeField] private float m_Range = 2.0f;
+        [SerializeField] private LayerMask m_InteractableMask;
+
+        [Header("Context")]
+        [Tooltip("Görüş/aim kaynağı. Player'da camera pivot, NPC'de head olabilir. ÖNERİLİR.")]
+        [SerializeField] private Transform m_ViewTransform;
+
+        [Header("Targeting")]
+        [SerializeField] private bool m_UseViewAngle = true;
+
+        [Range(1f, 180f)]
+        [SerializeField] private float m_MaxViewAngle = 70f;
+
+        [SerializeField] private bool m_RequireLineOfSight = true;
+
+        [SerializeField] private LayerMask m_OcclusionMask;
+
+        [Tooltip("Legacy. ClosestPoint kullanıldığı için artık sadece debug/override amaçlı.")]
+        [SerializeField] private Vector3 m_TargetOffset = new Vector3(0f, 1.0f, 0f);
+
+        [Header("Scoring")]
+        [Min(0f)]
+        [SerializeField] private float m_DistanceWeight = 1.0f;
+
+        [Min(0f)]
+        [SerializeField] private float m_AngleWeight = 1.0f;
+
+        [Header("Input")]
+        [SerializeField] private KeyCode m_InteractKey = KeyCode.E;
+
+        [Header("Debug")]
+        [SerializeField] private bool m_DrawDebug = true;
+
+        [Tooltip("Etkileşim denemesinde adayların neden elendiğini loglar.")]
+        [SerializeField] private bool m_DebugLogs = false;
+
+        #endregion
+
+        #region Constants
+
+        private const int OverlapBufferSize = 16;
+        private const float MinVectorSqr = 0.0001f;
+
+        #endregion
+
+        #region Fields
+
+        private readonly Collider[] m_Overlap = new Collider[OverlapBufferSize];
+
+        private HoldInteractable m_ActiveHold;
+        private float m_HoldElapsed;
+        private float m_HoldDuration;
+        private InteractorContext m_HoldContext;
+
+        private IInteractable m_LastTarget;
+        private InteractionCheckResult m_LastTargetCheck;
+
+        #endregion
+
+        #region Properties
+
+        public float HoldProgress01
+        {
+            get
+            {
+                if (m_ActiveHold == null || m_HoldDuration <= 0f)
+                    return 0f;
+
+                return Mathf.Clamp01(m_HoldElapsed / m_HoldDuration);
+            }
+        }
+
+        public IInteractable LastTarget => m_LastTarget;
+
+        public InteractionCheckResult LastTargetCheck => m_LastTargetCheck;
+
+        #endregion
+
+        #region Unity
+
+        private void Reset()
+        {
+            if (m_ViewTransform == null)
+                m_ViewTransform = transform;
+        }
+
+        private void Update()
+        {
+            if (m_ActiveHold != null)
+            {
+                UpdateHold();
+                return;
+            }
+
+            if (!Input.GetKeyDown(m_InteractKey))
+                return;
+
+            if (m_DrawDebug)
+                DebugDrawSphere(transform.position, m_Range);
+
+            var context = new InteractorContext(gameObject, m_ViewTransform);
+
+            if (!TryFindBest(context, out IInteractable best, out InteractionCheckResult bestCheck))
+            {
+                if (m_DebugLogs)
+                    Debug.Log($"{name}: No valid interactable found.", this);
+
+                return;
+            }
+
+            m_LastTarget = best;
+            m_LastTargetCheck = bestCheck;
+
+            if (m_DebugLogs)
+                Debug.Log($"{name}: Best target = {best} | type={best.Type} | reason={bestCheck.BlockReason}", this);
+
+            if (best is HoldInteractable hold)
+            {
+                BeginHold(hold, context, bestCheck);
+                return;
+            }
+
+            best.Interact(context);
+        }
+
+        #endregion
+
+        #region Hold Flow
+
+        private void BeginHold(HoldInteractable hold, InteractorContext context, InteractionCheckResult checkResult)
+        {
+            if (!checkResult.CanInteract)
+                return;
+
+            float duration = hold.GetHoldDuration(context);
+            if (duration <= 0f)
+            {
+                if (m_DebugLogs)
+                    Debug.LogWarning($"{name}: Hold duration invalid: {duration} (hold={hold.name})", this);
+                return;
+            }
+
+            m_ActiveHold = hold;
+            m_HoldContext = context;
+            m_HoldElapsed = 0f;
+            m_HoldDuration = duration;
+
+            m_ActiveHold.BeginInteract(context);
+
+            if (m_DebugLogs)
+                Debug.Log($"{name}: Hold started on {hold.name} duration={duration}", this);
+        }
+
+        private void UpdateHold()
+        {
+            if (Input.GetKeyUp(m_InteractKey))
+            {
+                if (m_DebugLogs)
+                    Debug.Log($"{name}: Hold canceled (key up).", this);
+
+                m_ActiveHold.CancelInteract(m_HoldContext);
+                ClearHold();
+                return;
+            }
+
+            if (!Input.GetKey(m_InteractKey))
+            {
+                if (m_DebugLogs)
+                    Debug.Log($"{name}: Hold canceled (key not held).", this);
+
+                m_ActiveHold.CancelInteract(m_HoldContext);
+                ClearHold();
+                return;
+            }
+
+            m_HoldElapsed += Time.deltaTime;
+
+            if (m_HoldElapsed >= m_HoldDuration)
+            {
+                if (m_DebugLogs)
+                    Debug.Log($"{name}: Hold completed.", this);
+
+                m_ActiveHold.CompleteInteract(m_HoldContext);
+                ClearHold();
+            }
+        }
+
+        private void ClearHold()
+        {
+            m_ActiveHold = null;
+            m_HoldElapsed = 0f;
+            m_HoldDuration = 0f;
+            m_HoldContext = default;
+        }
+
+        #endregion
+
+        #region Target Selection
+
+        private bool TryFindBest(InteractorContext context, out IInteractable best, out InteractionCheckResult bestCheck)
+        {
+            best = null;
+            bestCheck = default;
+
+            Transform view = context.ViewTransform != null ? context.ViewTransform : context.InteractorTransform;
+            Vector3 origin = view.position;
+
+            // Forward fallback (bazı riglerde forward saçmalayabilir)
+            Vector3 forward = view.forward;
+            if (forward.sqrMagnitude < MinVectorSqr)
+                forward = context.InteractorTransform.forward;
+
+            int count = Physics.OverlapSphereNonAlloc(
+                transform.position,
+                m_Range,
+                m_Overlap,
+                m_InteractableMask,
+                QueryTriggerInteraction.Collide);
+
+            if (m_DebugLogs)
+                Debug.Log($"{name}: Overlap count={count}", this);
+
+            if (count <= 0)
+                return false;
+
+            float bestScore = float.MaxValue;
+
+            for (int i = 0; i < count; i++)
+            {
+                Collider col = m_Overlap[i];
+                if (col == null)
+                {
+                    if (m_DebugLogs)
+                        Debug.LogWarning($"{name}: Candidate collider is null at index {i}.", this);
+
+                    continue;
+                }
+
+                // Door-proof: self/parent/root children fallback
+                IInteractable candidate =
+                    col.GetComponent<IInteractable>() ??
+                    col.GetComponentInParent<IInteractable>() ??
+                    col.transform.root.GetComponentInChildren<IInteractable>();
+
+                if (candidate == null)
+                {
+                    if (m_DebugLogs)
+                        Debug.Log($"{name}: Reject '{col.name}' -> no IInteractable found (self/parent/root children).", this);
+
+                    continue;
+                }
+
+                // Door-proof target: ClosestPoint (offset pivot saçmalığını bitirir)
+                Vector3 targetPos = col.ClosestPoint(origin);
+
+                Vector3 toTarget = targetPos - origin;
+                float sqrDistance = toTarget.sqrMagnitude;
+
+                if (sqrDistance <= MinVectorSqr)
+                {
+                    if (m_DebugLogs)
+                        Debug.Log($"{name}: Reject '{candidate}' -> too close/invalid vector.", this);
+
+                    continue;
+                }
+
+                float angle01 = 0f;
+                if (m_UseViewAngle)
+                {
+                    float angle = Vector3.Angle(forward, toTarget);
+                    if (angle > m_MaxViewAngle)
+                    {
+                        if (m_DebugLogs)
+                            Debug.Log($"{name}: Reject '{candidate}' -> angle {angle:0.0} > {m_MaxViewAngle:0.0}. " +
+                                      $"(origin={origin}, target={targetPos}, forward={forward})", this);
+
+                        continue;
+                    }
+
+                    angle01 = Mathf.Clamp01(angle / m_MaxViewAngle);
+                }
+
+                if (m_RequireLineOfSight)
+                {
+                    if (!HasLineOfSight(origin, targetPos, col, out string losHitInfo))
+                    {
+                        if (m_DebugLogs)
+                            Debug.Log($"{name}: Reject '{candidate}' -> LOS blocked ({losHitInfo}).", this);
+
+                        continue;
+                    }
+                }
+
+                InteractionCheckResult check = GetCheckResult(candidate, context);
+                if (!check.CanInteract)
+                {
+                    if (m_DebugLogs)
+                        Debug.Log($"{name}: Reject '{candidate}' -> Check failed reason={check.BlockReason} remaining={check.RemainingTime:0.00}.", this);
+
+                    continue;
+                }
+
+                float distance01 = Mathf.Clamp01(sqrDistance / (m_Range * m_Range));
+                float score = (distance01 * m_DistanceWeight) + (angle01 * m_AngleWeight);
+
+                if (m_DebugLogs)
+                    Debug.Log($"{name}: Candidate OK '{candidate}' dist01={distance01:0.00} angle01={angle01:0.00} score={score:0.000}.", this);
+
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = candidate;
+                    bestCheck = check;
+                }
+            }
+
+            if (m_DebugLogs && best != null)
+                Debug.Log($"{name}: Selected BEST '{best}' score={bestScore:0.000}", this);
+
+            return best != null;
+        }
+
+        private bool HasLineOfSight(Vector3 origin, Vector3 target, Collider targetCollider, out string hitInfo)
+        {
+            hitInfo = "clear";
+
+            Vector3 dir = target - origin;
+            float distance = dir.magnitude;
+            if (distance <= 0.0001f)
+                return true;
+
+            dir /= distance;
+
+            if (Physics.Raycast(origin, dir, out RaycastHit hit, distance, m_OcclusionMask, QueryTriggerInteraction.Ignore))
+            {
+                if (hit.collider == null)
+                    return true;
+
+                if (hit.collider.transform.root != targetCollider.transform.root)
+                {
+                    hitInfo = $"{hit.collider.name} (root={hit.collider.transform.root.name})";
+                    return false;
+                }
+
+                hitInfo = $"hit self '{hit.collider.name}'";
+            }
+
+            return true;
+        }
+
+        private static InteractionCheckResult GetCheckResult(IInteractable candidate, InteractorContext context)
+        {
+            if (candidate is IInteractionCheckable checkable)
+                return checkable.Check(context);
+
+            return candidate.CanInteract(context)
+                ? InteractionCheckResult.Allowed()
+                : InteractionCheckResult.Blocked(InteractionBlockReason.Custom);
+        }
+
+        #endregion
+
+        #region Debug
+
+        private static void DebugDrawSphere(Vector3 center, float radius)
+        {
+            Debug.DrawLine(center + Vector3.right * radius, center - Vector3.right * radius);
+            Debug.DrawLine(center + Vector3.forward * radius, center - Vector3.forward * radius);
+            Debug.DrawLine(center + Vector3.up * radius, center - Vector3.up * radius);
+        }
+
+        #endregion
+    }
+}
